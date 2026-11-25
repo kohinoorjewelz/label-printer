@@ -60,12 +60,14 @@ Get-Process -Name 'KohinoorLabelPrinter' -ErrorAction SilentlyContinue | Where-O
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'KohinoorLabelPrinter.exe') -Destination $binary -Force
 $settings = @{ Site = $site.GetLeftPart([UriPartial]::Authority); Token = $encrypted; Printer = $printer; Width = $width; Height = $height; Margin = $margin }
 [IO.File]::WriteAllText($config, ($settings | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-$shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'Kohinoor Label Printer.lnk'
+$oldStartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'Kohinoor Label Printer.lnk'
+if (Test-Path -LiteralPath $oldStartupShortcut) { Remove-Item -LiteralPath $oldStartupShortcut }
+$shortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'Kohinoor Label Printer.lnk'
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $binary
 $shortcut.WorkingDirectory = $directory
 $shortcut.Description = 'Kohinoor boutique label printer'
 $shortcut.Save()
-Start-Process -FilePath $binary -WindowStyle Hidden
-Write-Host "Installed for this Windows account. The helper starts when you sign in. Log: $directory\printer.log"
+Write-Host 'Installed. Open Kohinoor Label Printer from the Start menu to print queued labels. Close its window when finished.'
+Write-Host "Log: $directory\printer.log"

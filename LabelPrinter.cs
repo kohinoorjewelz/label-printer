@@ -10,6 +10,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
+using System.Windows.Forms;
 
 namespace BoutiqueLabels
 {
@@ -37,6 +38,7 @@ namespace BoutiqueLabels
     {
         public Job job { get; set; }
         public bool accepted { get; set; }
+        public string problem { get; set; }
     }
 
     internal static class LabelPrinter
@@ -44,6 +46,8 @@ namespace BoutiqueLabels
         private static readonly string DirectoryPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KohinoorLabelPrinter");
         private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+        private const int InitialPollDelayMs = 5000;
+        private const int MaxPollDelayMs = 30000;
         private static Uri endpoint;
         private static string token;
 
@@ -72,7 +76,7 @@ namespace BoutiqueLabels
                 {
                     try { if (!singleton.WaitOne(0)) return 0; }
                     catch (AbandonedMutexException) { }
-                    try { Run(); }
+                    try { RunWindow(); }
                     finally { singleton.ReleaseMutex(); }
                 }
             }
@@ -84,7 +88,67 @@ namespace BoutiqueLabels
             return 0;
         }
 
-        private static void Run()
+        private static void RunWindow()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            using (var stop = new ManualResetEventSlim())
+            using (var window = new Form { Text = "Kohinoor Label Printer", ClientSize = new Size(440, 180), StartPosition = FormStartPosition.CenterScreen, MinimumSize = new Size(390, 200) })
+            {
+                var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(16) };
+                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                var instructions = new Label { AutoSize = true, MaximumSize = new Size(360, 0), Text = "Keep this window open while printing. Close it when you’re done or before signing out." };
+                var status = new Label { Dock = DockStyle.Fill, Text = "Connecting to the store…", Padding = new Padding(0, 10, 0, 0) };
+                var close = new Button { AutoSize = true, Anchor = AnchorStyles.Right, Text = "Stop helper" };
+                layout.Controls.Add(instructions, 0, 0);
+                layout.Controls.Add(status, 0, 1);
+                layout.Controls.Add(close, 0, 2);
+                window.Controls.Add(layout);
+                bool finished = false;
+                close.Click += (sender, args) => window.Close();
+                window.FormClosing += (sender, args) =>
+                {
+                    if (finished || args.CloseReason == CloseReason.WindowsShutDown) return;
+                    args.Cancel = true;
+                    status.Text = "Stopping after the current label…";
+                    close.Enabled = false;
+                    stop.Set();
+                };
+                window.Shown += (sender, args) =>
+                {
+                    var progress = new Progress<string>(message => { if (!stop.IsSet) status.Text = message; });
+                    var worker = new Thread(() =>
+                    {
+                        string failure = null;
+                        try { Run(stop, progress); }
+                        catch (Exception error)
+                        {
+                            Log(error.Message);
+                            failure = "Could not start the helper. " + error.Message;
+                        }
+                        if (!window.IsHandleCreated) return;
+                        window.BeginInvoke(new Action(() =>
+                        {
+                            finished = true;
+                            if (failure == null || stop.IsSet) window.Close();
+                            else
+                            {
+                                status.Text = failure;
+                                close.Text = "Close";
+                            }
+                        }));
+                    });
+                    worker.IsBackground = true;
+                    worker.SetApartmentState(ApartmentState.STA);
+                    worker.Start();
+                };
+                Application.Run(window);
+            }
+        }
+
+        private static void Run(ManualResetEventSlim stop, IProgress<string> progress)
         {
             var settings = Json.Deserialize<Settings>(File.ReadAllText(Path.Combine(DirectoryPath, "config.json")));
             Uri site;
@@ -97,6 +161,7 @@ namespace BoutiqueLabels
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
             string lastError = null;
             object pendingReport = null;
+            int pollDelay = InitialPollDelayMs;
             while (true)
             {
                 try
@@ -106,25 +171,34 @@ namespace BoutiqueLabels
                         if (!Post(pendingReport).accepted) Log("Server rejected a submission report. Check the admin queue.");
                         pendingReport = null;
                     }
+                    if (stop.IsSet) return;
                     string problem = null;
                     try { using (CreateDocument(settings)) { } }
                     catch (Exception error) { problem = error.Message.Substring(0, Math.Min(error.Message.Length, 200)); }
-                    var job = Post(new { action = "poll", problem = problem }).job;
+                    var poll = Post(new { action = "poll", problem = problem });
+                    var job = poll.job;
                     if (job == null)
                     {
                         lastError = null;
-                        Thread.Sleep(5000);
+                        progress.Report(poll.problem ?? problem ?? "Connected. Waiting for labels.");
+                        stop.Wait(pollDelay);
+                        pollDelay = Math.Min(pollDelay * 2, MaxPollDelayMs);
                         continue;
                     }
+                    progress.Report("Sending label for " + job.sku + " to Windows…");
                     string status = Print(settings, job);
                     if (status != null) pendingReport = new { action = "report", id = job.id, leaseToken = job.leaseToken, status = status };
                     lastError = null;
+                    pollDelay = InitialPollDelayMs;
                 }
                 catch (Exception error)
                 {
                     if (error.Message != lastError) Log(error.Message);
                     lastError = error.Message;
-                    Thread.Sleep(5000);
+                    if (stop.IsSet) return;
+                    progress.Report("Could not reach the print queue. " + error.Message);
+                    if (stop.Wait(pollDelay)) return;
+                    pollDelay = Math.Min(pollDelay * 2, MaxPollDelayMs);
                 }
             }
         }
